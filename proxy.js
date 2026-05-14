@@ -1,13 +1,12 @@
 // proxy.js - Render 用プロキシ（Express + http-proxy-middleware）
-// 改良点：proxyReqPathResolver を使ってプロキシ先パスを明示的に組み立て、詳細ログを出力します。
 // - 静的ファイルは cdn/1/jimu-core を配信
 // - /api-chiban と /api-h-chiban をそれぞれ外部 API にプロキシ
 // - 起動ログとリクエストログを出力
+// - proxyReqPathResolver で送信先パスを明示的に組み立て、詳細ログを出力
 
 const express = require('express');
 const { createProxyMiddleware } = require('http-proxy-middleware');
 const path = require('path');
-const url = require('url');
 
 const app = express();
 
@@ -29,7 +28,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// 共通プロキシ生成（proxyReqPathResolver を使う版）
+// 共通プロキシ生成（proxyReqPathResolver を使う）
 function createChibanProxy(pathPrefix, targetBase, rewriteFromRegex) {
   return createProxyMiddleware({
     target: targetBase,
@@ -37,19 +36,17 @@ function createChibanProxy(pathPrefix, targetBase, rewriteFromRegex) {
     secure: true,
     logLevel: 'info',
 
-    // proxyReqPathResolver を使ってターゲットに送るパスを明示的に作る
+    // proxyReqPathResolver を使ってターゲットに送るパス（クエリ含む）を明示的に作る
     proxyReqPathResolver: function(req) {
       try {
         // req.originalUrl にはパス + クエリが入る（例: /api-chiban/searchChiban?appid=...）
         const original = req.originalUrl || req.url || '';
-        // 書き換え：先頭の /api-chiban を /api に置換
-        const rewrittenPath = original.replace(rewriteFromRegex, '/api');
-        // ログ出力（ここで何が送られるかを確実に把握）
-        console.log('[proxyReqPathResolver] original=%s rewritten=%s', original, rewrittenPath);
-        return rewrittenPath;
+        // 先頭の /api-chiban を /api に置換（rewriteFromRegex は /^\/api-chiban/ を渡す想定）
+        const rewritten = original.replace(rewriteFromRegex, '/api');
+        console.log('[proxyReqPathResolver] original=%s rewritten=%s', original, rewritten);
+        return rewritten;
       } catch (e) {
         console.error('[proxyReqPathResolver] error', e && e.message);
-        // フォールバックでそのまま返す
         return req.originalUrl || req.url || '/';
       }
     },
@@ -57,7 +54,6 @@ function createChibanProxy(pathPrefix, targetBase, rewriteFromRegex) {
     // デバッグとヘッダ付与
     onProxyReq: (proxyReq, req, res) => {
       try {
-        // proxyReq.path は内部的な path（クエリは含まれない場合がある）
         console.log('[onProxyReq] proxyReq.path=%s proxyReq.method=%s', proxyReq.path, proxyReq.method);
         console.log('[onProxyReq] proxyReq.getHeaders()=%j', proxyReq.getHeaders());
         console.log('[onProxyReq] original req.url=%s', req.originalUrl);
@@ -97,15 +93,16 @@ function createChibanProxy(pathPrefix, targetBase, rewriteFromRegex) {
       res.end('Proxy error');
     },
 
-    // 大文字小文字を保持（必要なら）
+    // 必要ならヘッダキーの大文字小文字を保持
     preserveHeaderKeyCase: true,
   });
 }
 
-// Proxy ルール（/api-chiban -> https://api-chiban.geospace.jp/api/...）
+// --- ここで必ず「1回だけ」ルートをマウントすること ---
+// /api-chiban を /api に書き換えて https://api-chiban.geospace.jp に転送する
 app.use('/api-chiban', createChibanProxy('/api-chiban', 'https://api-chiban.geospace.jp', /^\/api-chiban/));
 
-// もし別の API をプロキシするなら同様に追加（例: /api-h-chiban）
+// /api-h-chiban の例（必要なら有効化）
 app.use('/api-h-chiban', createChibanProxy('/api-h-chiban', 'https://api-h-chiban.moj.go.jp', /^\/api-h-chiban/));
 
 // 静的配信先（実際のビルド成果物がここにある想定）
