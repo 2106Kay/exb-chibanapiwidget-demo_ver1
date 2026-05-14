@@ -2,7 +2,7 @@
 // - 静的ファイルは cdn/1/jimu-core を配信
 // - /api-chiban と /api-h-chiban をそれぞれ外部 API にプロキシ
 // - 起動ログとリクエストログを出力
-// - エラー時に 502 を返す
+// - デバッグ用にターゲットへ送る path/headers をログ出力し、Host/Referer を明示的に設定
 
 const express = require('express');
 const { createProxyMiddleware } = require('http-proxy-middleware');
@@ -36,13 +36,25 @@ function createChibanProxy(pathPrefix, targetBase, rewriteFrom) {
     secure: true,
     logLevel: 'info',
     pathRewrite: (path, req) => {
-      // /api-chiban/... -> /api/...
+      // デフォルトは /api-chiban/... -> /api/...
+      // 必要に応じてここを調整してください
       return path.replace(rewriteFrom, '/api');
     },
     onProxyReq: (proxyReq, req, res) => {
-      // 必要ならここで追加ヘッダを付与（例: Referer, X-Requested-With）
-      // proxyReq.setHeader('Referer', 'https://exb-chibanapiwidget-demo-ver1.onrender.com/');
+      // デバッグログ：ターゲットに送るメソッド・パス・ヘッダを出力
+      try {
+        console.log('[proxy->target] method=%s path=%s headers=%j', proxyReq.method, proxyReq.path, proxyReq.getHeaders());
+      } catch (e) {
+        console.error('[proxy->target] log error', e && e.message);
+      }
+
+      // 明示的に Host と Referer を設定（proxy が変えてしまう場合に備える）
+      proxyReq.setHeader('Host', new URL(targetBase).host);
+      proxyReq.setHeader('Referer', 'https://exb-chibanapiwidget-demo-ver1.onrender.com/');
       proxyReq.setHeader('X-Requested-With', 'XMLHttpRequest');
+
+      // もし API が追加ヘッダを要求するならここで設定（例）
+      // proxyReq.setHeader('X-API-Key', process.env.CHIBAN_API_KEY || 'your_key_here');
     },
     onProxyRes: (proxyRes, req, res) => {
       // CORS を通す
