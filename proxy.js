@@ -1,12 +1,12 @@
-// proxy.js - Render 用プロキシ（Express + http-proxy-middleware）
-// 注意：このファイルは「デバッグ強化＋一時的 TLS 回避」を含みます。
-// 恒久対策としては API 提供側の TLS 設定更新（安全なネゴシエーション対応）を依頼してください。
+// proxy.js - Render 用プロキシ（Express）
+// 全文置換用ファイル：http-proxy-middleware を残しつつ、確実に動くサーバ側フェッチのフォールバックを追加します。
 
 const express = require('express');
 const { createProxyMiddleware } = require('http-proxy-middleware');
 const path = require('path');
 const https = require('https');
 const crypto = require('crypto');
+const { URL } = require('url');
 
 const app = express();
 
@@ -27,8 +27,13 @@ app.use((req, res, next) => {
   next();
 });
 
-// 共通プロキシ生成（proxyReqPathResolver を使う）
-function createChibanProxy(pathPrefix, targetBase, rewriteFromRegex) {
+// 共通 agent（OpenSSL legacy renegotiation を一時許可する設定）
+const legacyAgent = new https.Agent({
+  secureOptions: crypto.constants.SSL_OP_LEGACY_SERVER_CONNECT
+});
+
+// createChibanProxy（既存の proxy ミドルウェア）
+function createChibanProxy(targetBase, rewriteFromRegex) {
   return createProxyMiddleware({
     target: targetBase,
     changeOrigin: true,
@@ -36,14 +41,7 @@ function createChibanProxy(pathPrefix, targetBase, rewriteFromRegex) {
     logLevel: 'debug',
     proxyTimeout: 15000,
     timeout: 20000,
-
-    // ここで agent を指定して OpenSSL のレガシー再ネゴを許可（**一時対処**）
-    agent: new https.Agent({
-      // Node/OpenSSL の定数を使って legacy renegotiation を許可
-      secureOptions: crypto.constants.SSL_OP_LEGACY_SERVER_CONNECT
-    }),
-
-    // proxyReqPathResolver でパス＋クエリを明示的に組み立ててログ出力
+    agent: legacyAgent,
     proxyReqPathResolver: function(req) {
       try {
         const original = req.originalUrl || req.url || '';
@@ -56,7 +54,6 @@ function createChibanProxy(pathPrefix, targetBase, rewriteFromRegex) {
         return req.originalUrl || req.url || '/';
       }
     },
-
     onProxyReq: (proxyReq, req, res) => {
       try {
         console.log('[onProxyReq] proxyReq.path=%s proxyReq.method=%s', proxyReq.path, proxyReq.method);
@@ -65,8 +62,6 @@ function createChibanProxy(pathPrefix, targetBase, rewriteFromRegex) {
       } catch (e) {
         console.error('[onProxyReq] log error', e && e.stack || e);
       }
-
-      // Host は上書きしない（Cloudflare の拒否を避ける）
       try {
         proxyReq.setHeader('Referer', 'https://exb-chibanapiwidget-demo-ver1.onrender.com/');
         proxyReq.setHeader('X-Requested-With', 'XMLHttpRequest');
@@ -74,7 +69,6 @@ function createChibanProxy(pathPrefix, targetBase, rewriteFromRegex) {
         console.error('[onProxyReq] setHeader error', e && e.stack || e);
       }
     },
-
     onProxyRes: (proxyRes, req, res) => {
       try {
         proxyRes.headers['access-control-allow-origin'] = '*';
@@ -86,73 +80,69 @@ function createChibanProxy(pathPrefix, targetBase, rewriteFromRegex) {
         console.error('[onProxyRes] error', e && e.stack || e);
       }
     },
-
     onError: (err, req, res) => {
       console.error('[proxy] onError message=%s', err && err.message);
       console.error('[proxy] onError stack=%s', err && err.stack);
       try {
         const targetHost = new URL(targetBase).host;
         console.error('[proxy] targetHost=%s', targetHost);
-      } catch (e) {
-        // ignore
-      }
+      } catch (e) {}
       if (!res.headersSent) {
         res.writeHead(502, { 'Content-Type': 'text/plain' });
       }
       res.end('Proxy error');
     },
-
     preserveHeaderKeyCase: true,
   });
 }
 
-// --- ここで必ず「1回だけ」ルートをマウントすること ---
-app.use('/api-chiban', createChibanProxy('/api-chiban', 'https://api-chiban.geospace.jp', /^\/api-chiban/));
-app.use('/api-h-chiban', createChibanProxy('/api-h-chiban', 'https://api-h-chiban.moj.go.jp', /^\/api-h-chiban/));
+// マウント（http-proxy-middleware）
+app.use('/api-chiban', createChibanProxy('https://api-chiban.geospace.jp', /^\/api-chiban/));
+app.use('/api-h-chiban', createChibanProxy('https://api-h-chiban.moj.go.jp', /^\/api-h-chiban/));
 
-// デバッグ用プローブ：Render 実行環境からターゲットへ直接接続できるか確認するエンドポイント
-// 確認後はこのエンドポイントを削除してください
-app.get('/__probe_target', (req, res) => {
-  const target = 'https://api-chiban.geospace.jp/api/searchChiban?appid=ArcGIS_Pro_chiban_add-in&string=' + encodeURIComponent('東京都台東区雷門1-4') + '&limit=1';
-  console.log('[probe] requesting target=%s', target);
+// -----------------------------
+// フォールバック：サーバ側フェッチ（確実に動く経路）
+// /api-chiban-proxy?appid=...&string=...&limit=...&is_num=...
+// -----------------------------
+app.get('/api-chiban-proxy', (req, res) => {
+  // クエリをそのままターゲットに渡す（既に URLSearchParams でエンコード済みのはず）
+  const params = new URLSearchParams(req.query).toString();
+  const targetUrl = `https://api-chiban.geospace.jp/api/searchChiban?${params}`;
+  console.log('[fallback] proxying to targetUrl=%s', targetUrl);
 
-  const parsed = new URL(target);
+  const parsed = new URL(targetUrl);
   const opts = {
     hostname: parsed.hostname,
     path: parsed.pathname + parsed.search,
     method: 'GET',
     port: 443,
-    timeout: 10000,
+    timeout: 15000,
     headers: {
-      'User-Agent': 'render-probe/1.0',
+      'User-Agent': 'render-fallback-proxy/1.0',
       'Accept': 'application/json'
     },
-    // 同じ agent を使って TLS の挙動を合わせる
-    agent: new https.Agent({
-      secureOptions: crypto.constants.SSL_OP_LEGACY_SERVER_CONNECT
-    })
+    agent: legacyAgent
   };
 
   const req2 = https.request(opts, (r) => {
-    let body = '';
-    r.on('data', (chunk) => body += chunk);
-    r.on('end', () => {
-      console.log('[probe] status=%s headers=%j', r.statusCode, r.headers && {
-        'content-type': r.headers['content-type'],
-        'content-length': r.headers['content-length']
-      });
-      res.status(200).json({ probeStatus: r.statusCode, probeHeaders: r.headers, probeBodySample: body.slice(0, 1000) });
+    res.statusCode = r.statusCode || 502;
+    // copy headers (but avoid hop-by-hop headers)
+    Object.keys(r.headers || {}).forEach((k) => {
+      if (!['connection','keep-alive','transfer-encoding','upgrade','proxy-authenticate','proxy-authorization','te'].includes(k.toLowerCase())) {
+        res.setHeader(k, r.headers[k]);
+      }
     });
+    r.pipe(res);
   });
 
   req2.on('timeout', () => {
-    console.error('[probe] request timeout');
+    console.error('[fallback] request timeout to target');
     req2.destroy();
-    res.status(504).send('probe timeout');
+    res.status(504).send('fallback proxy timeout');
   });
 
   req2.on('error', (err) => {
-    console.error('[probe] request error', err && err.stack || err);
+    console.error('[fallback] request error', err && err.stack || err);
     res.status(502).json({ error: err && err.message });
   });
 
@@ -173,7 +163,7 @@ app.get('/', (req, res) => {
   });
 });
 
-// GET の HTML リクエストはすべて index.html にフォールバック（SPA）
+// SPA フォールバック
 app.use((req, res, next) => {
   if (req.method === 'GET' && req.accepts('html')) {
     return res.sendFile(path.join(publicDir, 'index.html'), (err) => {
@@ -186,11 +176,11 @@ app.use((req, res, next) => {
   next();
 });
 
-// 404 ハンドラ（API など）
+// 404 ハンドラ
 app.use((req, res) => {
   res.status(404).send('Not Found');
 });
 
-// ポートは Render の環境変数を使う
+// 起動
 const port = process.env.PORT || 4000;
 app.listen(port, () => console.log(`Server running on port ${port}`));
