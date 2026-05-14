@@ -1,12 +1,12 @@
 // proxy.js - Render 用プロキシ（Express + http-proxy-middleware）
-// デバッグ強化版：onError でスタックを出力、proxyTimeout を設定、proxyReqPathResolver ログ強化、
-// Render 実行環境からターゲットへ直接叩く /__probe_target を追加（デバッグ用）
+// 注意：このファイルは「デバッグ強化＋一時的 TLS 回避」を含みます。
+// 恒久対策としては API 提供側の TLS 設定更新（安全なネゴシエーション対応）を依頼してください。
 
 const express = require('express');
 const { createProxyMiddleware } = require('http-proxy-middleware');
 const path = require('path');
 const https = require('https');
-const url = require('url');
+const crypto = require('crypto');
 
 const app = express();
 
@@ -33,9 +33,15 @@ function createChibanProxy(pathPrefix, targetBase, rewriteFromRegex) {
     target: targetBase,
     changeOrigin: true,
     secure: true,
-    logLevel: 'debug',            // 詳細ログ
-    proxyTimeout: 15000,          // ターゲット応答待ちタイムアウト（ms）
-    timeout: 20000,               // クライアント接続タイムアウト（ms）
+    logLevel: 'debug',
+    proxyTimeout: 15000,
+    timeout: 20000,
+
+    // ここで agent を指定して OpenSSL のレガシー再ネゴを許可（**一時対処**）
+    agent: new https.Agent({
+      // Node/OpenSSL の定数を使って legacy renegotiation を許可
+      secureOptions: crypto.constants.SSL_OP_LEGACY_SERVER_CONNECT
+    }),
 
     // proxyReqPathResolver でパス＋クエリを明示的に組み立ててログ出力
     proxyReqPathResolver: function(req) {
@@ -82,10 +88,8 @@ function createChibanProxy(pathPrefix, targetBase, rewriteFromRegex) {
     },
 
     onError: (err, req, res) => {
-      // ここで詳細なエラー情報を出力する（必ずログに残す）
       console.error('[proxy] onError message=%s', err && err.message);
       console.error('[proxy] onError stack=%s', err && err.stack);
-      // 可能ならターゲットのホスト名をログに出す
       try {
         const targetHost = new URL(targetBase).host;
         console.error('[proxy] targetHost=%s', targetHost);
@@ -107,7 +111,7 @@ app.use('/api-chiban', createChibanProxy('/api-chiban', 'https://api-chiban.geos
 app.use('/api-h-chiban', createChibanProxy('/api-h-chiban', 'https://api-h-chiban.moj.go.jp', /^\/api-h-chiban/));
 
 // デバッグ用プローブ：Render 実行環境からターゲットへ直接接続できるか確認するエンドポイント
-// 注意：デバッグ用。確認後は削除してください。
+// 確認後はこのエンドポイントを削除してください
 app.get('/__probe_target', (req, res) => {
   const target = 'https://api-chiban.geospace.jp/api/searchChiban?appid=ArcGIS_Pro_chiban_add-in&string=' + encodeURIComponent('東京都台東区雷門1-4') + '&limit=1';
   console.log('[probe] requesting target=%s', target);
@@ -122,7 +126,11 @@ app.get('/__probe_target', (req, res) => {
     headers: {
       'User-Agent': 'render-probe/1.0',
       'Accept': 'application/json'
-    }
+    },
+    // 同じ agent を使って TLS の挙動を合わせる
+    agent: new https.Agent({
+      secureOptions: crypto.constants.SSL_OP_LEGACY_SERVER_CONNECT
+    })
   };
 
   const req2 = https.request(opts, (r) => {
