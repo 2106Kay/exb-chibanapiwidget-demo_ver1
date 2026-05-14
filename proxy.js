@@ -1,28 +1,40 @@
-// proxy.js - Render 用プロキシ（恒久運用向け）
-// - GEOSPACE API 互換性を維持（必要時に legacy TLS を有効化）
-// - 本番向けの安全対策を組み込み：APIキー保護、オリジン制限、簡易レート制限、詳細ログ
-// - ファイルを丸ごと置き換えてください
+// proxy.js - Render production proxy (final version)
+// Purpose:
+// - Fully server-side fetch proxy for GEOSPACE chiban APIs and 法務省地番 APIs
+// - Keeps widget unchanged: widget continues to call /api-chiban/* and /api-h-chiban/*
+// - Handles TLS renegotiation compatibility via optional legacy OpenSSL flag
+// - Absorbs CORS for browser clients
+// - Adds origin restriction, simple rate limiting, admin endpoint, and detailed logs
+//
+// Deployment notes:
+// - Replace existing proxy.js with this file and set environment variables in Render:
+//   PORT (optional), ALLOW_LEGACY_TLS (true|false), CHIBAN_APPID, H_CHIBAN_APPID,
+//   ALLOWED_ORIGINS (comma separated), ADMIN_TOKEN (optional), RATE_LIMIT_WINDOW_MS, RATE_LIMIT_MAX
+//
+// Security notes:
+// - ALLOW_LEGACY_TLS=true enables legacy renegotiation compatibility (security tradeoff).
+// - If corporate policy forbids legacy TLS, set ALLOW_LEGACY_TLS=false and use an internal proxy that permits legacy TLS only inside your network.
 
 const express = require('express');
-const path = require('path');
 const https = require('https');
+const http = require('http');
+const { URL } = require('url');
+const path = require('path');
 const crypto = require('crypto');
-const { URL, URLSearchParams } = require('url');
 
 const app = express();
 
-// --- 設定（環境変数で制御） ---
-// 必須: CHIBAN_APPID または CHIBAN_API_KEY を Render の環境変数に設定してください。
-// ALLOW_LEGACY_TLS=true にすると legacy OpenSSL オプションを有効化します（セキュリティ注意）。
+// --- Configuration via environment variables ---
 const PORT = process.env.PORT || 4000;
 const ALLOW_LEGACY_TLS = (process.env.ALLOW_LEGACY_TLS || 'true') === 'true';
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean); // 空なら全許可（開発）
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN || ''; // 管理用トークン（任意だが推奨）
-const CHIBAN_APPID = process.env.CHIBAN_APPID || ''; // 可能ならサーバ側で保持して使う
-const RATE_LIMIT_WINDOW_MS = parseInt(process.env.RATE_LIMIT_WINDOW_MS || '60000', 10); // 1分
-const RATE_LIMIT_MAX = parseInt(process.env.RATE_LIMIT_MAX || '120', 10); // 1分あたりの最大リクエスト数（調整可）
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
+const CHIBAN_APPID = process.env.CHIBAN_APPID || '';         // optional server-side appid for GEOSPACE chiban
+const H_CHIBAN_APPID = process.env.H_CHIBAN_APPID || '';     // optional server-side appid for 法務省
+const RATE_LIMIT_WINDOW_MS = parseInt(process.env.RATE_LIMIT_WINDOW_MS || '60000', 10); // 1 minute
+const RATE_LIMIT_MAX = parseInt(process.env.RATE_LIMIT_MAX || '120', 10); // requests per window per IP
 
-// --- 簡易レートリミッタ（IPベース、メモリ） ---
+// --- Simple in-memory rate limiter (IP-based) ---
 const rateMap = new Map();
 function checkRateLimit(ip) {
   const now = Date.now();
@@ -37,25 +49,34 @@ function checkRateLimit(ip) {
   return rec.count <= RATE_LIMIT_MAX;
 }
 
-// --- legacyAgent（必要時のみ） ---
-let legacyAgent = undefined;
+// --- Legacy agent for OpenSSL renegotiation compatibility (optional) ---
+let agent;
 if (ALLOW_LEGACY_TLS) {
-  legacyAgent = new https.Agent({
+  agent = new https.Agent({
     secureOptions: crypto.constants.SSL_OP_LEGACY_SERVER_CONNECT
   });
-  console.log('proxy: ALLOW_LEGACY_TLS enabled (legacy OpenSSL options active)');
+  console.log('proxy: ALLOW_LEGACY_TLS enabled');
 } else {
-  legacyAgent = new https.Agent();
-  console.log('proxy: ALLOW_LEGACY_TLS disabled (default secure agent)');
+  agent = new https.Agent();
+  console.log('proxy: ALLOW_LEGACY_TLS disabled');
 }
 
-// --- ミドルウェア: CORS / Origin チェック ---
+// --- Utility: copy response headers excluding hop-by-hop ---
+function copyResponseHeaders(srcHeaders, res) {
+  const hopByHop = new Set(['connection','keep-alive','proxy-authenticate','proxy-authorization','te','trailers','transfer-encoding','upgrade']);
+  Object.keys(srcHeaders || {}).forEach(k => {
+    if (!hopByHop.has(k.toLowerCase())) {
+      res.setHeader(k, srcHeaders[k]);
+    }
+  });
+}
+
+// --- Middleware: CORS / Origin check ---
 app.use((req, res, next) => {
   const origin = req.headers.origin || req.headers.referer || '';
   if (ALLOWED_ORIGINS.length > 0) {
     const ok = ALLOWED_ORIGINS.some(o => origin.startsWith(o));
     if (!ok) {
-      // ブラウザからの直接アクセスは拒否（API はサーバ経由を想定）
       res.setHeader('Access-Control-Allow-Origin', 'null');
       return res.status(403).send('Origin not allowed');
     }
@@ -69,13 +90,13 @@ app.use((req, res, next) => {
   next();
 });
 
-// --- リクエストログ（簡潔） ---
+// --- Simple request logging ---
 app.use((req, res, next) => {
   console.log(`[incoming] ${req.method} ${req.originalUrl} ip:${req.ip} origin:${req.headers.origin || '-'}`);
   next();
 });
 
-// --- ヘルスチェック / 管理用（管理トークンがあれば利用） ---
+// --- Health and admin endpoints ---
 app.get('/__health', (req, res) => {
   res.json({ status: 'ok', time: new Date().toISOString() });
 });
@@ -83,129 +104,169 @@ app.get('/__admin/status', (req, res) => {
   if (!ADMIN_TOKEN || req.headers['x-admin-token'] !== ADMIN_TOKEN) {
     return res.status(403).send('forbidden');
   }
-  res.json({ status: 'running', allowLegacyTls: ALLOW_LEGACY_TLS });
+  res.json({
+    status: 'running',
+    allowLegacyTls: ALLOW_LEGACY_TLS,
+    rateLimitWindowMs: RATE_LIMIT_WINDOW_MS,
+    rateLimitMax: RATE_LIMIT_MAX
+  });
 });
 
-// -----------------------------
-// メイン：サーバ側フェッチ経路（安全に GEOSPACE API に合わせる）
-// エンドポイント: /api-chiban-proxy
-// クライアントはこのエンドポイントを呼ぶ（クエリは URLSearchParams で組み立てること）
-// -----------------------------
-app.get('/api-chiban-proxy', (req, res) => {
-  // レート制限
+// --- Core proxy helper: perform server-side request to targetUrl and pipe response ---
+function proxyRequestToTarget(req, res, targetUrl, options = {}) {
+  try {
+    const parsed = new URL(targetUrl);
+    const opts = {
+      hostname: parsed.hostname,
+      port: parsed.port || 443,
+      path: parsed.pathname + parsed.search,
+      method: req.method || 'GET',
+      headers: Object.assign({}, req.headers, options.overrideHeaders || {}),
+      timeout: options.timeout || 15000,
+      agent: agent
+    };
+
+    // Remove hop-by-hop headers that should not be forwarded
+    delete opts.headers['host'];
+    delete opts.headers['connection'];
+    delete opts.headers['keep-alive'];
+    delete opts.headers['transfer-encoding'];
+    delete opts.headers['upgrade'];
+    delete opts.headers['proxy-authorization'];
+    delete opts.headers['proxy-authenticate'];
+
+    // Ensure Accept header
+    if (!opts.headers['accept']) opts.headers['accept'] = 'application/json';
+
+    const proxyReq = https.request(opts, (proxyRes) => {
+      res.statusCode = proxyRes.statusCode || 502;
+      // Copy headers except hop-by-hop
+      copyResponseHeaders(proxyRes.headers, res);
+      // Ensure CORS headers are present for browser
+      if (!res.getHeader('Access-Control-Allow-Origin')) {
+        res.setHeader('Access-Control-Allow-Origin', '*');
+      }
+      proxyRes.pipe(res);
+    });
+
+    proxyReq.on('timeout', () => {
+      console.error('[proxyRequestToTarget] timeout', targetUrl);
+      proxyReq.destroy();
+      if (!res.headersSent) res.status(504).send('Gateway Timeout');
+    });
+
+    proxyReq.on('error', (err) => {
+      console.error('[proxyRequestToTarget] error', targetUrl, err && err.stack || err);
+      if (!res.headersSent) res.status(502).json({ error: 'Proxy request failed' });
+    });
+
+    // If there is a body (POST/PUT), pipe it
+    if (req.method && ['POST','PUT','PATCH'].includes(req.method.toUpperCase())) {
+      req.pipe(proxyReq);
+    } else {
+      proxyReq.end();
+    }
+  } catch (err) {
+    console.error('[proxyRequestToTarget] exception', err && err.stack || err);
+    if (!res.headersSent) res.status(500).send('Internal Server Error');
+  }
+}
+
+// --- Normalize endpoint path helper ---
+function normalizeEndpointPath(basePath) {
+  // basePath expected like '/api-chiban/searchChiban' or '/api-chiban/searchChiban/'
+  // We want to map to '/api/searchChiban' on target host
+  // Remove leading slash and api-chiban prefix
+  let p = basePath || '';
+  if (p.startsWith('/')) p = p.slice(1);
+  // remove 'api-chiban' or 'chiban' or 'api-h-chiban' or 'houmu' prefixes
+  p = p.replace(/^api-chiban\/?/, 'api/');
+  p = p.replace(/^chiban\/?/, 'api/');
+  p = p.replace(/^api-h-chiban\/?/, 'api/');
+  p = p.replace(/^houmu\/?/, 'api/');
+  if (!p.startsWith('api/')) p = 'api/' + p;
+  return p;
+}
+
+// --- Main routes: handle /api-chiban/* and /chiban/* and /api-h-chiban/* and /houmu/* ---
+// These routes perform server-side fetch to the real GEOSPACE endpoints and return results to browser.
+
+app.all(['/chiban/*', '/api-chiban/*'], (req, res) => {
+  // Rate limiting
   const ip = req.ip || req.connection.remoteAddress || 'unknown';
   if (!checkRateLimit(ip)) {
-    console.warn('[rate] limit exceeded ip=%s', ip);
+    console.warn('[rate] limit exceeded ip=%s url=%s', ip, req.originalUrl);
     return res.status(429).send('Too Many Requests');
   }
 
-  // 必要ならサーバ側で appid を付与（クライアントに appid を持たせたくない場合）
-  const params = new URLSearchParams(req.query);
+  // Build target path and query
+  const endpointPath = normalizeEndpointPath(req.path); // e.g., api/searchChiban
+  const query = req.url.includes('?') ? req.url.split('?')[1] : '';
+  // Prefer server-side CHIBAN_APPID if provided and client didn't include appid
+  const params = new URLSearchParams(query || '');
   if (!params.has('appid') && CHIBAN_APPID) {
     params.set('appid', CHIBAN_APPID);
   }
+  const targetUrl = `https://api-chiban.geospace.jp/${endpointPath.replace(/^api\//,'api/')}${params.toString() ? '?' + params.toString() : ''}`;
 
-  // 組み立て
-  const target = `https://api-chiban.geospace.jp/api/searchChiban?${params.toString()}`;
-  console.log('[fallback] proxying to target=%s ip=%s', target, ip);
-
-  const parsed = new URL(target);
-  const opts = {
-    hostname: parsed.hostname,
-    path: parsed.pathname + parsed.search,
-    method: 'GET',
-    port: 443,
-    timeout: 15000,
-    headers: {
-      'User-Agent': 'render-fallback-proxy/1.0',
-      'Accept': 'application/json',
-      // 参照元を明示（必要なら）
-      'Referer': 'https://exb-chibanapiwidget-demo-ver1.onrender.com/'
-    },
-    agent: legacyAgent
-  };
-
-  const req2 = https.request(opts, (r) => {
-    // ステータスとヘッダを透過（ホップバイホップは除外）
-    res.statusCode = r.statusCode || 502;
-    Object.keys(r.headers || {}).forEach((k) => {
-      if (!['connection','keep-alive','transfer-encoding','upgrade','proxy-authenticate','proxy-authorization','te'].includes(k.toLowerCase())) {
-        res.setHeader(k, r.headers[k]);
-      }
-    });
-    r.pipe(res);
-  });
-
-  req2.on('timeout', () => {
-    console.error('[fallback] request timeout to target');
-    req2.destroy();
-    res.status(504).send('fallback proxy timeout');
-  });
-
-  req2.on('error', (err) => {
-    console.error('[fallback] request error', err && err.stack || err);
-    // エラー詳細はログに残すが、クライアントには簡潔に返す
-    res.status(502).json({ error: 'Proxy request failed' });
-  });
-
-  req2.end();
+  console.log('[proxy] /api-chiban -> targetUrl=%s ip=%s method=%s', targetUrl, ip, req.method);
+  proxyRequestToTarget(req, res, targetUrl);
 });
 
-// -----------------------------
-// 旧ルート互換（必要なら残すが、推奨は /api-chiban-proxy を使う）
-// -----------------------------
-app.get('/api-chiban/*', (req, res) => {
-  // 互換的に /api-chiban/... を /api/... に書き換えて直接転送する簡易実装
-  // ただし本番では /api-chiban-proxy を使うことを推奨
-  const original = req.originalUrl || req.url || '';
-  const rewritten = original.replace(/^\/api-chiban/, '/api');
-  const target = `https://api-chiban.geospace.jp${rewritten}`;
-  console.log('[compat] forwarding to target=%s', target);
+app.all(['/houmu/*', '/api-h-chiban/*'], (req, res) => {
+  // Rate limiting
+  const ip = req.ip || req.connection.remoteAddress || 'unknown';
+  if (!checkRateLimit(ip)) {
+    console.warn('[rate] limit exceeded ip=%s url=%s', ip, req.originalUrl);
+    return res.status(429).send('Too Many Requests');
+  }
 
-  const parsed = new URL(target);
-  const opts = {
-    hostname: parsed.hostname,
-    path: parsed.pathname + parsed.search,
-    method: 'GET',
-    port: 443,
-    timeout: 15000,
-    headers: {
-      'User-Agent': 'render-compat-proxy/1.0',
-      'Accept': 'application/json',
-      'Referer': 'https://exb-chibanapiwidget-demo-ver1.onrender.com/'
-    },
-    agent: legacyAgent
-  };
+  const endpointPath = normalizeEndpointPath(req.path);
+  const query = req.url.includes('?') ? req.url.split('?')[1] : '';
+  const params = new URLSearchParams(query || '');
+  if (!params.has('appid') && H_CHIBAN_APPID) {
+    params.set('appid', H_CHIBAN_APPID);
+  }
+  const targetUrl = `https://api-h-chiban.geospace.jp/${endpointPath.replace(/^api\//,'api/')}${params.toString() ? '?' + params.toString() : ''}`;
 
-  const req2 = https.request(opts, (r) => {
-    res.statusCode = r.statusCode || 502;
-    Object.keys(r.headers || {}).forEach((k) => {
-      if (!['connection','keep-alive','transfer-encoding','upgrade','proxy-authenticate','proxy-authorization','te'].includes(k.toLowerCase())) {
-        res.setHeader(k, r.headers[k]);
-      }
-    });
-    r.pipe(res);
-  });
-
-  req2.on('timeout', () => {
-    console.error('[compat] request timeout to target');
-    req2.destroy();
-    res.status(504).send('compat proxy timeout');
-  });
-
-  req2.on('error', (err) => {
-    console.error('[compat] request error', err && err.stack || err);
-    res.status(502).json({ error: 'Compat proxy failed' });
-  });
-
-  req2.end();
+  console.log('[proxy] /api-h-chiban -> targetUrl=%s ip=%s method=%s', targetUrl, ip, req.method);
+  proxyRequestToTarget(req, res, targetUrl);
 });
 
-// 静的配信（ビルド成果物）
+// --- Backwards-compatible simple proxy endpoints (optional) ---
+// These map /api-chiban-proxy and /api-h-chiban-proxy to the same server-side fetch behavior.
+// They are kept for compatibility with earlier debugging routes.
+app.get('/api-chiban-proxy', (req, res) => {
+  const ip = req.ip || req.connection.remoteAddress || 'unknown';
+  if (!checkRateLimit(ip)) {
+    console.warn('[rate] limit exceeded ip=%s url=%s', ip, req.originalUrl);
+    return res.status(429).send('Too Many Requests');
+  }
+  const params = new URLSearchParams(req.query);
+  if (!params.has('appid') && CHIBAN_APPID) params.set('appid', CHIBAN_APPID);
+  const targetUrl = `https://api-chiban.geospace.jp/api/searchChiban?${params.toString()}`;
+  console.log('[proxy] /api-chiban-proxy -> %s', targetUrl);
+  proxyRequestToTarget(req, res, targetUrl);
+});
+
+app.get('/api-h-chiban-proxy', (req, res) => {
+  const ip = req.ip || req.connection.remoteAddress || 'unknown';
+  if (!checkRateLimit(ip)) {
+    console.warn('[rate] limit exceeded ip=%s url=%s', ip, req.originalUrl);
+    return res.status(429).send('Too Many Requests');
+  }
+  const params = new URLSearchParams(req.query);
+  if (!params.has('appid') && H_CHIBAN_APPID) params.set('appid', H_CHIBAN_APPID);
+  const targetUrl = `https://api-h-chiban.geospace.jp/api/searchChiban?${params.toString()}`;
+  console.log('[proxy] /api-h-chiban-proxy -> %s', targetUrl);
+  proxyRequestToTarget(req, res, targetUrl);
+});
+
+// --- Static assets (Experience Builder build output) ---
 const publicDir = path.join(__dirname, 'cdn', '1', 'jimu-core');
 app.use(express.static(publicDir));
 
-// SPA フォールバック
+// SPA fallback
 app.get('/', (req, res) => {
   res.sendFile(path.join(publicDir, 'index.html'), (err) => {
     if (err) {
@@ -226,10 +287,13 @@ app.use((req, res, next) => {
   next();
 });
 
-// 404
+// 404 handler
 app.use((req, res) => {
   res.status(404).send('Not Found');
 });
 
-// 起動
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+// Start server
+app.listen(PORT, () => {
+  console.log(`Proxy server listening on port ${PORT}`);
+  console.log(`ALLOW_LEGACY_TLS=${ALLOW_LEGACY_TLS} CHIBAN_APPID=${!!CHIBAN_APPID} H_CHIBAN_APPID=${!!H_CHIBAN_APPID}`);
+});
