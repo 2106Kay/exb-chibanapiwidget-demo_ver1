@@ -1,0 +1,12 @@
+{
+  "name": "exb-chibanapiwidget-demo",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start": "node proxy.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "http-proxy-middleware": "^2.0.6"
+  }
+}
