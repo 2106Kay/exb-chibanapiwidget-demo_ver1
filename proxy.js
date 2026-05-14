@@ -1,19 +1,18 @@
 // proxy.js - Render 用プロキシ（Express + http-proxy-middleware）
-// - 静的ファイルは cdn/1/jimu-core を配信
-// - /api-chiban と /api-h-chiban をそれぞれ外部 API にプロキシ
-// - 起動ログとリクエストログを出力
-// - proxyReqPathResolver で送信先パスを明示的に組み立て、詳細ログを出力
+// デバッグ強化版：onError でスタックを出力、proxyTimeout を設定、proxyReqPathResolver ログ強化、
+// Render 実行環境からターゲットへ直接叩く /__probe_target を追加（デバッグ用）
 
 const express = require('express');
 const { createProxyMiddleware } = require('http-proxy-middleware');
 const path = require('path');
+const https = require('https');
+const url = require('url');
 
 const app = express();
 
-// 起動時ログ
 console.log('proxy.js loaded, NODE_ENV=' + (process.env.NODE_ENV || 'undefined'));
 
-// CORS を許可（ブラウザからの fetch を通す）
+// CORS を許可
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
@@ -34,78 +33,125 @@ function createChibanProxy(pathPrefix, targetBase, rewriteFromRegex) {
     target: targetBase,
     changeOrigin: true,
     secure: true,
-    logLevel: 'info',
+    logLevel: 'debug',            // 詳細ログ
+    proxyTimeout: 15000,          // ターゲット応答待ちタイムアウト（ms）
+    timeout: 20000,               // クライアント接続タイムアウト（ms）
 
-    // proxyReqPathResolver を使ってターゲットに送るパス（クエリ含む）を明示的に作る
+    // proxyReqPathResolver でパス＋クエリを明示的に組み立ててログ出力
     proxyReqPathResolver: function(req) {
       try {
-        // req.originalUrl にはパス + クエリが入る（例: /api-chiban/searchChiban?appid=...）
         const original = req.originalUrl || req.url || '';
-        // 先頭の /api-chiban を /api に置換（rewriteFromRegex は /^\/api-chiban/ を渡す想定）
         const rewritten = original.replace(rewriteFromRegex, '/api');
-        console.log('[proxyReqPathResolver] original=%s rewritten=%s', original, rewritten);
+        console.log('[proxyReqPathResolver] original=%s', original);
+        console.log('[proxyReqPathResolver] rewritten=%s', rewritten);
         return rewritten;
       } catch (e) {
-        console.error('[proxyReqPathResolver] error', e && e.message);
+        console.error('[proxyReqPathResolver] error', e && e.stack || e);
         return req.originalUrl || req.url || '/';
       }
     },
 
-    // デバッグとヘッダ付与
     onProxyReq: (proxyReq, req, res) => {
       try {
         console.log('[onProxyReq] proxyReq.path=%s proxyReq.method=%s', proxyReq.path, proxyReq.method);
         console.log('[onProxyReq] proxyReq.getHeaders()=%j', proxyReq.getHeaders());
         console.log('[onProxyReq] original req.url=%s', req.originalUrl);
       } catch (e) {
-        console.error('[onProxyReq] log error', e && e.message);
+        console.error('[onProxyReq] log error', e && e.stack || e);
       }
 
       // Host は上書きしない（Cloudflare の拒否を避ける）
-      // 参照元チェックがある場合に備えて Referer と X-Requested-With を付与
       try {
         proxyReq.setHeader('Referer', 'https://exb-chibanapiwidget-demo-ver1.onrender.com/');
         proxyReq.setHeader('X-Requested-With', 'XMLHttpRequest');
       } catch (e) {
-        console.error('[onProxyReq] setHeader error', e && e.message);
+        console.error('[onProxyReq] setHeader error', e && e.stack || e);
       }
     },
 
     onProxyRes: (proxyRes, req, res) => {
       try {
-        // レスポンスヘッダに CORS を追加
         proxyRes.headers['access-control-allow-origin'] = '*';
-        // ログ：ターゲットからのステータスと一部ヘッダ
         console.log('[onProxyRes] status=%s headers=%j', proxyRes.statusCode, {
           'content-type': proxyRes.headers['content-type'],
           'content-length': proxyRes.headers['content-length']
         });
       } catch (e) {
-        console.error('[onProxyRes] error', e && e.message);
+        console.error('[onProxyRes] error', e && e.stack || e);
       }
     },
 
     onError: (err, req, res) => {
-      console.error('[proxy] error', err && err.message);
+      // ここで詳細なエラー情報を出力する（必ずログに残す）
+      console.error('[proxy] onError message=%s', err && err.message);
+      console.error('[proxy] onError stack=%s', err && err.stack);
+      // 可能ならターゲットのホスト名をログに出す
+      try {
+        const targetHost = new URL(targetBase).host;
+        console.error('[proxy] targetHost=%s', targetHost);
+      } catch (e) {
+        // ignore
+      }
       if (!res.headersSent) {
         res.writeHead(502, { 'Content-Type': 'text/plain' });
       }
       res.end('Proxy error');
     },
 
-    // 必要ならヘッダキーの大文字小文字を保持
     preserveHeaderKeyCase: true,
   });
 }
 
 // --- ここで必ず「1回だけ」ルートをマウントすること ---
-// /api-chiban を /api に書き換えて https://api-chiban.geospace.jp に転送する
 app.use('/api-chiban', createChibanProxy('/api-chiban', 'https://api-chiban.geospace.jp', /^\/api-chiban/));
-
-// /api-h-chiban の例（必要なら有効化）
 app.use('/api-h-chiban', createChibanProxy('/api-h-chiban', 'https://api-h-chiban.moj.go.jp', /^\/api-h-chiban/));
 
-// 静的配信先（実際のビルド成果物がここにある想定）
+// デバッグ用プローブ：Render 実行環境からターゲットへ直接接続できるか確認するエンドポイント
+// 注意：デバッグ用。確認後は削除してください。
+app.get('/__probe_target', (req, res) => {
+  const target = 'https://api-chiban.geospace.jp/api/searchChiban?appid=ArcGIS_Pro_chiban_add-in&string=' + encodeURIComponent('東京都台東区雷門1-4') + '&limit=1';
+  console.log('[probe] requesting target=%s', target);
+
+  const parsed = new URL(target);
+  const opts = {
+    hostname: parsed.hostname,
+    path: parsed.pathname + parsed.search,
+    method: 'GET',
+    port: 443,
+    timeout: 10000,
+    headers: {
+      'User-Agent': 'render-probe/1.0',
+      'Accept': 'application/json'
+    }
+  };
+
+  const req2 = https.request(opts, (r) => {
+    let body = '';
+    r.on('data', (chunk) => body += chunk);
+    r.on('end', () => {
+      console.log('[probe] status=%s headers=%j', r.statusCode, r.headers && {
+        'content-type': r.headers['content-type'],
+        'content-length': r.headers['content-length']
+      });
+      res.status(200).json({ probeStatus: r.statusCode, probeHeaders: r.headers, probeBodySample: body.slice(0, 1000) });
+    });
+  });
+
+  req2.on('timeout', () => {
+    console.error('[probe] request timeout');
+    req2.destroy();
+    res.status(504).send('probe timeout');
+  });
+
+  req2.on('error', (err) => {
+    console.error('[probe] request error', err && err.stack || err);
+    res.status(502).json({ error: err && err.message });
+  });
+
+  req2.end();
+});
+
+// 静的配信先
 const publicDir = path.join(__dirname, 'cdn', '1', 'jimu-core');
 app.use(express.static(publicDir));
 
