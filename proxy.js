@@ -32,9 +32,10 @@ app.use((req, res, next) => {
 function createChibanProxy(pathPrefix, targetBase, rewriteFromRegex) {
   return createProxyMiddleware(pathPrefix, {
     target: targetBase,
-    changeOrigin: true,    // 通常はターゲットの Host に合わせる
+    changeOrigin: true,    // ターゲットの Host に合わせる（通常は true）
     secure: true,
     logLevel: 'info',
+
     // pathRewrite: /api-chiban/... -> /api/...
     pathRewrite: (path, req) => {
       try {
@@ -44,8 +45,9 @@ function createChibanProxy(pathPrefix, targetBase, rewriteFromRegex) {
         return path;
       }
     },
+
+    // デバッグとヘッダ付与
     onProxyReq: (proxyReq, req, res) => {
-      // デバッグログ：ターゲットに送るメソッド・パス・ヘッダを出力
       try {
         console.log('[proxy->target] method=%s path=%s headers=%j', proxyReq.method, proxyReq.path, proxyReq.getHeaders());
         console.log('[proxy->target] original req.url=%s', req.url);
@@ -67,6 +69,7 @@ function createChibanProxy(pathPrefix, targetBase, rewriteFromRegex) {
       //   proxyReq.setHeader('X-API-Key', process.env.CHIBAN_API_KEY);
       // }
     },
+
     onProxyRes: (proxyRes, req, res) => {
       // CORS を通す（レスポンスヘッダに追加）
       try {
@@ -75,6 +78,7 @@ function createChibanProxy(pathPrefix, targetBase, rewriteFromRegex) {
         console.error('onProxyRes error', e && e.message);
       }
     },
+
     onError: (err, req, res) => {
       console.error('[proxy] error', err && err.message);
       if (!res.headersSent) {
@@ -82,6 +86,7 @@ function createChibanProxy(pathPrefix, targetBase, rewriteFromRegex) {
       }
       res.end('Proxy error');
     },
+
     // クエリやヘッダの大文字小文字を保持する設定（必要に応じて）
     preserveHeaderKeyCase: true,
   });
