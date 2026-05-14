@@ -1,12 +1,13 @@
 // proxy.js - Render 用プロキシ（Express + http-proxy-middleware）
+// 改良点：proxyReqPathResolver を使ってプロキシ先パスを明示的に組み立て、詳細ログを出力します。
 // - 静的ファイルは cdn/1/jimu-core を配信
 // - /api-chiban と /api-h-chiban をそれぞれ外部 API にプロキシ
 // - 起動ログとリクエストログを出力
-// - デバッグ用にターゲットへ送る path/headers をログ出力し、Referer/X-Requested-With を付与
 
 const express = require('express');
 const { createProxyMiddleware } = require('http-proxy-middleware');
 const path = require('path');
+const url = require('url');
 
 const app = express();
 
@@ -28,54 +29,63 @@ app.use((req, res, next) => {
   next();
 });
 
-// Proxy 共通オプションファクトリ
+// 共通プロキシ生成（proxyReqPathResolver を使う版）
 function createChibanProxy(pathPrefix, targetBase, rewriteFromRegex) {
-  return createProxyMiddleware(pathPrefix, {
+  return createProxyMiddleware({
     target: targetBase,
-    changeOrigin: true,    // ターゲットの Host に合わせる（通常は true）
+    changeOrigin: true,
     secure: true,
     logLevel: 'info',
 
-    // pathRewrite: /api-chiban/... -> /api/...
-    pathRewrite: (path, req) => {
+    // proxyReqPathResolver を使ってターゲットに送るパスを明示的に作る
+    proxyReqPathResolver: function(req) {
       try {
-        return path.replace(rewriteFromRegex, '/api');
+        // req.originalUrl にはパス + クエリが入る（例: /api-chiban/searchChiban?appid=...）
+        const original = req.originalUrl || req.url || '';
+        // 書き換え：先頭の /api-chiban を /api に置換
+        const rewrittenPath = original.replace(rewriteFromRegex, '/api');
+        // ログ出力（ここで何が送られるかを確実に把握）
+        console.log('[proxyReqPathResolver] original=%s rewritten=%s', original, rewrittenPath);
+        return rewrittenPath;
       } catch (e) {
-        console.error('pathRewrite error', e && e.message);
-        return path;
+        console.error('[proxyReqPathResolver] error', e && e.message);
+        // フォールバックでそのまま返す
+        return req.originalUrl || req.url || '/';
       }
     },
 
     // デバッグとヘッダ付与
     onProxyReq: (proxyReq, req, res) => {
       try {
-        console.log('[proxy->target] method=%s path=%s headers=%j', proxyReq.method, proxyReq.path, proxyReq.getHeaders());
-        console.log('[proxy->target] original req.url=%s', req.url);
+        // proxyReq.path は内部的な path（クエリは含まれない場合がある）
+        console.log('[onProxyReq] proxyReq.path=%s proxyReq.method=%s', proxyReq.path, proxyReq.method);
+        console.log('[onProxyReq] proxyReq.getHeaders()=%j', proxyReq.getHeaders());
+        console.log('[onProxyReq] original req.url=%s', req.originalUrl);
       } catch (e) {
-        console.error('[proxy->target] log error', e && e.message);
+        console.error('[onProxyReq] log error', e && e.message);
       }
 
-      // Cloudflare 等のフロントで Host を偽装すると拒否されることがあるため Host は上書きしない
-      // 代わりに Referer と X-Requested-With を付与してブラウザ由来のリクエストであることを示す
+      // Host は上書きしない（Cloudflare の拒否を避ける）
+      // 参照元チェックがある場合に備えて Referer と X-Requested-With を付与
       try {
         proxyReq.setHeader('Referer', 'https://exb-chibanapiwidget-demo-ver1.onrender.com/');
         proxyReq.setHeader('X-Requested-With', 'XMLHttpRequest');
       } catch (e) {
-        console.error('setHeader error', e && e.message);
+        console.error('[onProxyReq] setHeader error', e && e.message);
       }
-
-      // 必要ならここで追加ヘッダを環境変数から付与（例）
-      // if (process.env.CHIBAN_API_KEY) {
-      //   proxyReq.setHeader('X-API-Key', process.env.CHIBAN_API_KEY);
-      // }
     },
 
     onProxyRes: (proxyRes, req, res) => {
-      // CORS を通す（レスポンスヘッダに追加）
       try {
+        // レスポンスヘッダに CORS を追加
         proxyRes.headers['access-control-allow-origin'] = '*';
+        // ログ：ターゲットからのステータスと一部ヘッダ
+        console.log('[onProxyRes] status=%s headers=%j', proxyRes.statusCode, {
+          'content-type': proxyRes.headers['content-type'],
+          'content-length': proxyRes.headers['content-length']
+        });
       } catch (e) {
-        console.error('onProxyRes error', e && e.message);
+        console.error('[onProxyRes] error', e && e.message);
       }
     },
 
@@ -87,16 +97,16 @@ function createChibanProxy(pathPrefix, targetBase, rewriteFromRegex) {
       res.end('Proxy error');
     },
 
-    // クエリやヘッダの大文字小文字を保持する設定（必要に応じて）
+    // 大文字小文字を保持（必要なら）
     preserveHeaderKeyCase: true,
   });
 }
 
 // Proxy ルール（/api-chiban -> https://api-chiban.geospace.jp/api/...）
-app.use(createChibanProxy('/api-chiban', 'https://api-chiban.geospace.jp', /^\/api-chiban/));
+app.use('/api-chiban', createChibanProxy('/api-chiban', 'https://api-chiban.geospace.jp', /^\/api-chiban/));
 
 // もし別の API をプロキシするなら同様に追加（例: /api-h-chiban）
-app.use(createChibanProxy('/api-h-chiban', 'https://api-h-chiban.moj.go.jp', /^\/api-h-chiban/));
+app.use('/api-h-chiban', createChibanProxy('/api-h-chiban', 'https://api-h-chiban.moj.go.jp', /^\/api-h-chiban/));
 
 // 静的配信先（実際のビルド成果物がここにある想定）
 const publicDir = path.join(__dirname, 'cdn', '1', 'jimu-core');
